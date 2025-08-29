@@ -18,24 +18,24 @@ type Closer interface {
 	Close() error
 }
 
-type zeroCloser struct{}
-
-func (z *zeroCloser) Close() error { return nil }
-
 // token represents an acquired resource that can be released. It holds direct
 // references to both global and client semaphores for efficient release.
 type token struct {
 	globalSem chan struct{} // reference to global semaphore
 	clientSem chan struct{} // reference to client-specific semaphore
-	closed    int32         // atomic flag to prevent double-close
+	closed    atomic.Bool   // atomic flag to prevent double-close
 }
 
 // Close releases the acquired resources back to both client and global
 // semaphores. Returns an error if semaphores are in an inconsistent state.
 // It is safe to call Close multiple times.
 func (t *token) Close() error {
+	if t == nil {
+		return nil
+	}
+
 	// Atomic check-and-set to prevent double-close
-	if !atomic.CompareAndSwapInt32(&t.closed, 0, 1) {
+	if t.closed.Swap(true) {
 		return nil // already closed
 	}
 
@@ -123,11 +123,11 @@ func (l *Limiter[K]) Acquire(clientID K) (bool, Closer) {
 		case <-timer.C():
 			// Client semaphore timeout, release global
 			<-l.globalSem
-			return false, &zeroCloser{}
+			return false, nil
 		}
 	case <-timer.C():
 		// Global semaphore timeout
-		return false, &zeroCloser{}
+		return false, nil
 	}
 }
 
