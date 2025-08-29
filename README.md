@@ -29,7 +29,7 @@ func main() {
     limiter := clientlimiter.NewLimiter[string](10, 3, time.Second)
     
     // Acquire resource
-    if closer := limiter.Acquire("client1"); closer != nil {
+    if closer, ok := limiter.Acquire("client1"); ok {
         defer closer.Close()
         // Do work...
         fmt.Println("Work completed")

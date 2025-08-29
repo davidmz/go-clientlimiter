@@ -16,6 +16,10 @@ type Closer interface {
 	Close() error
 }
 
+type zeroCloser struct{}
+
+func (z *zeroCloser) Close() error { return nil }
+
 // token represents an acquired resource that can be released. It holds direct
 // references to both global and client semaphores for efficient release.
 type token struct {
@@ -72,10 +76,12 @@ func NewLimiter[K comparable](globalLimit, perClientLimit int, maxDelay time.Dur
 	}
 }
 
-// Acquire attempts to acquire a resource for the specified client. It enforces
-// both global and per-client limits with a timeout. Returns a Closer that must
-// be called to release the resource, or nil if acquisition failed.
-func (l *Limiter[K]) Acquire(clientID K) Closer {
+// Acquire tries to secure a resource for the given client, adhering to both
+// global and per-client constraints with a specified timeout. It returns a
+// boolean indicating success and a Closer which should be invoked to release
+// the resource. The Closer is always non-nil, but it is a no-op if the
+// acquisition failed.
+func (l *Limiter[K]) Acquire(clientID K) (bool, Closer) {
 	// Double-checked locking pattern to find or create client semaphore
 	l.mu.RLock()
 	clientSem, ok := l.clientSems[clientID]
@@ -106,18 +112,18 @@ func (l *Limiter[K]) Acquire(clientID K) Closer {
 		select {
 		case clientSem <- struct{}{}:
 			// Both acquired successfully
-			return &token{
+			return true, &token{
 				globalSem: l.globalSem,
 				clientSem: clientSem,
 			}
 		case <-timer.C:
 			// Client semaphore timeout, release global
 			<-l.globalSem
-			return nil
+			return false, &zeroCloser{}
 		}
 	case <-timer.C:
 		// Global semaphore timeout
-		return nil
+		return false, &zeroCloser{}
 	}
 }
 

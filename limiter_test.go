@@ -31,8 +31,8 @@ func TestBasicAcquireRelease(t *testing.T) {
 	limiter := NewLimiter[string](5, 2, time.Second)
 
 	// Acquire resource
-	closer := limiter.Acquire("client1")
-	if closer == nil {
+	ok, closer := limiter.Acquire("client1")
+	if !ok {
 		t.Fatal("Failed to acquire resource")
 	}
 
@@ -53,19 +53,19 @@ func TestGlobalLimit(t *testing.T) {
 	limiter := NewLimiter[string](2, 5, 100*time.Millisecond)
 
 	// Acquire up to global limit
-	closer1 := limiter.Acquire("client1")
-	closer2 := limiter.Acquire("client2")
+	ok1, closer1 := limiter.Acquire("client1")
+	ok2, closer2 := limiter.Acquire("client2")
 
-	if closer1 == nil || closer2 == nil {
+	if !ok1 || !ok2 {
 		t.Fatal("Should be able to acquire up to global limit")
 	}
 
 	// Third acquisition should timeout
 	start := time.Now()
-	closer3 := limiter.Acquire("client3")
+	ok3, _ := limiter.Acquire("client3")
 	elapsed := time.Since(start)
 
-	if closer3 != nil {
+	if ok3 {
 		t.Error("Should not be able to exceed global limit")
 	}
 
@@ -75,8 +75,8 @@ func TestGlobalLimit(t *testing.T) {
 
 	// Release and try again
 	closer1.Close()
-	closer4 := limiter.Acquire("client4")
-	if closer4 == nil {
+	ok4, closer4 := limiter.Acquire("client4")
+	if !ok4 {
 		t.Error("Should be able to acquire after release")
 	}
 
@@ -88,19 +88,19 @@ func TestPerClientLimit(t *testing.T) {
 	limiter := NewLimiter[string](10, 2, 100*time.Millisecond)
 
 	// Acquire up to per-client limit
-	closer1 := limiter.Acquire("client1")
-	closer2 := limiter.Acquire("client1")
+	ok1, closer1 := limiter.Acquire("client1")
+	ok2, closer2 := limiter.Acquire("client1")
 
-	if closer1 == nil || closer2 == nil {
+	if !ok1 || !ok2 {
 		t.Fatal("Should be able to acquire up to per-client limit")
 	}
 
 	// Third acquisition for same client should timeout
 	start := time.Now()
-	closer3 := limiter.Acquire("client1")
+	ok3, _ := limiter.Acquire("client1")
 	elapsed := time.Since(start)
 
-	if closer3 != nil {
+	if ok3 {
 		t.Error("Should not be able to exceed per-client limit")
 	}
 
@@ -109,8 +109,8 @@ func TestPerClientLimit(t *testing.T) {
 	}
 
 	// Different client should still work
-	closer4 := limiter.Acquire("client2")
-	if closer4 == nil {
+	ok4, closer4 := limiter.Acquire("client2")
+	if !ok4 {
 		t.Error("Different client should be able to acquire")
 	}
 
@@ -135,8 +135,8 @@ func TestConcurrentAccess(t *testing.T) {
 
 			successes := 0
 			for range numAcquisitions {
-				closer := limiter.Acquire(clientID)
-				if closer != nil {
+				ok, closer := limiter.Acquire(clientID)
+				if ok {
 					successes++
 					// Hold for longer to create contention
 					time.Sleep(20 * time.Millisecond)
@@ -174,8 +174,8 @@ func TestCleanup(t *testing.T) {
 	clients := []string{"client1", "client2", "client3"}
 
 	for _, client := range clients {
-		closer := limiter.Acquire(client)
-		if closer == nil {
+		ok, closer := limiter.Acquire(client)
+		if !ok {
 			t.Fatalf("Failed to acquire for %s", client)
 		}
 		closer.Close()
@@ -207,14 +207,14 @@ func TestCleanupWithActiveSemaphores(t *testing.T) {
 	limiter := NewLimiter[string](10, 2, time.Second)
 
 	// Acquire resource and don't release
-	closer1 := limiter.Acquire("client1")
-	if closer1 == nil {
+	ok1, closer1 := limiter.Acquire("client1")
+	if !ok1 {
 		t.Fatal("Failed to acquire for client1")
 	}
 
 	// Acquire and release for another client
-	closer2 := limiter.Acquire("client2")
-	if closer2 == nil {
+	ok2, closer2 := limiter.Acquire("client2")
+	if !ok2 {
 		t.Fatal("Failed to acquire for client2")
 	}
 	closer2.Close()
@@ -251,8 +251,8 @@ func TestErrorConditions(t *testing.T) {
 	// This test is tricky because we need to create an inconsistent state
 	// In normal usage, this shouldn't happen, but we test error handling
 
-	closer := limiter.Acquire("client1")
-	if closer == nil {
+	ok, closer := limiter.Acquire("client1")
+	if !ok {
 		t.Fatal("Failed to acquire resource")
 	}
 
@@ -281,17 +281,17 @@ func TestZeroTimeout(t *testing.T) {
 	limiter := NewLimiter[string](1, 1, 1*time.Nanosecond) // Very short timeout
 
 	// First acquisition should succeed
-	closer1 := limiter.Acquire("client1")
-	if closer1 == nil {
+	ok1, closer1 := limiter.Acquire("client1")
+	if !ok1 {
 		t.Fatal("First acquisition should succeed")
 	}
 
 	// Second acquisition should fail immediately
 	start := time.Now()
-	closer2 := limiter.Acquire("client2")
+	ok2, _ := limiter.Acquire("client2")
 	elapsed := time.Since(start)
 
-	if closer2 != nil {
+	if ok2 {
 		t.Error("Second acquisition should fail with zero timeout")
 	}
 
@@ -309,8 +309,8 @@ func TestStartPeriodicCleanup(t *testing.T) {
 	// Create some client semaphores
 	clients := []string{"client1", "client2", "client3"}
 	for _, client := range clients {
-		closer := limiter.Acquire(client)
-		if closer == nil {
+		ok, closer := limiter.Acquire(client)
+		if !ok {
 			t.Fatalf("Failed to acquire for %s", client)
 		}
 		closer.Close()
@@ -356,8 +356,8 @@ func TestClientLoad(t *testing.T) {
 	}
 
 	// Acquire one resource
-	closer1 := limiter.Acquire("client1")
-	if closer1 == nil {
+	ok1, closer1 := limiter.Acquire("client1")
+	if !ok1 {
 		t.Fatal("Failed to acquire first resource")
 	}
 
@@ -367,8 +367,8 @@ func TestClientLoad(t *testing.T) {
 	}
 
 	// Acquire second resource
-	closer2 := limiter.Acquire("client1")
-	if closer2 == nil {
+	ok2, closer2 := limiter.Acquire("client1")
+	if !ok2 {
 		t.Fatal("Failed to acquire second resource")
 	}
 
@@ -378,8 +378,8 @@ func TestClientLoad(t *testing.T) {
 	}
 
 	// Acquire third resource (should reach limit)
-	closer3 := limiter.Acquire("client1")
-	if closer3 == nil {
+	ok3, closer3 := limiter.Acquire("client1")
+	if !ok3 {
 		t.Fatal("Failed to acquire third resource")
 	}
 
@@ -406,8 +406,8 @@ func TestClientLoad(t *testing.T) {
 	}
 
 	// Test different client
-	closer4 := limiter.Acquire("client2")
-	if closer4 == nil {
+	ok4, closer4 := limiter.Acquire("client2")
+	if !ok4 {
 		t.Fatal("Failed to acquire for client2")
 	}
 
@@ -439,8 +439,8 @@ func TestClientLoadConcurrent(t *testing.T) {
 			defer wg.Done()
 
 			for range 10 {
-				closer := limiter.Acquire(clientID)
-				if closer != nil {
+				ok, closer := limiter.Acquire(clientID)
+				if ok {
 					// Check load while holding resource
 					used, total := limiter.ClientLoad(clientID)
 					if used < 0 || used > total {
@@ -480,8 +480,7 @@ func BenchmarkAcquireRelease(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		clientID := 0
 		for pb.Next() {
-			closer := limiter.Acquire(clientID)
-			if closer != nil {
+			if ok, closer := limiter.Acquire(clientID); ok {
 				closer.Close()
 			}
 			clientID = (clientID + 1) % 10 // Rotate through 10 clients
@@ -496,8 +495,7 @@ func BenchmarkHighContention(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		clientID := 0
 		for pb.Next() {
-			closer := limiter.Acquire(clientID)
-			if closer != nil {
+			if ok, closer := limiter.Acquire(clientID); ok {
 				closer.Close()
 			}
 			clientID = (clientID + 1) % 100 // Many clients competing
