@@ -28,7 +28,7 @@ type token struct {
 
 // Close releases the acquired resources back to both client and global
 // semaphores. Returns an error if semaphores are in an inconsistent state.
-// It is safe to call Close multiple times.
+// It is safe to call Close multiple times and on a nil token.
 func (t *token) Close() error {
 	if t == nil {
 		return nil
@@ -81,10 +81,9 @@ func NewLimiter[K comparable](globalLimit, perClientLimit int, maxDelay time.Dur
 }
 
 // Acquire tries to secure a resource for the given client, adhering to both
-// global and per-client constraints with a specified timeout. It returns a
-// boolean indicating success and a Closer which should be invoked to release
-// the resource. The Closer is always non-nil, but it is a no-op if the
-// acquisition failed.
+// global and per-client constraints with a specified timeout.
+// Returns: ok and closer. If ok is false, closer will be nil.
+// Calling Close on a nil closer is safe and is a no-op.
 func (l *Limiter[K]) Acquire(clientID K) (bool, Closer) {
 	// Double-checked locking pattern to find or create client semaphore
 	l.mu.RLock()
@@ -105,6 +104,23 @@ func (l *Limiter[K]) Acquire(clientID K) (bool, Closer) {
 	// use)
 	l.mu.RLock()
 	defer l.mu.RUnlock()
+
+	// Fast happy path: check if both semaphores are available
+	select {
+	case l.globalSem <- struct{}{}:
+		select {
+		case clientSem <- struct{}{}:
+			return true, &token{
+				globalSem: l.globalSem,
+				clientSem: clientSem,
+			}
+		default:
+			// Client semaphore is full, release global and go to timer
+			<-l.globalSem
+		}
+	default:
+		// Global semaphore is full, use timer
+	}
 
 	timer := l.timers.Get(l.maxDelay)
 	defer timer.Put()
