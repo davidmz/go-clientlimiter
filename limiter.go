@@ -121,6 +121,17 @@ func (l *Limiter[K]) Acquire(clientID K) Closer {
 	}
 }
 
+// ClientLoad returns the current load for a specific client in a non-blocking way.
+// It returns the number of currently used tokens and the total capacity for the client.
+// If the client has never acquired resources, it returns (0, maxPerClient).
+// This method is useful for monitoring and load balancing decisions.
+func (l *Limiter[K]) ClientLoad(clientID K) (used, total int) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	clientSem := l.clientSems[clientID]
+	return len(clientSem), l.maxPerClient
+}
+
 // StartPeriodicCleanup starts a background goroutine that periodically removes
 // unused client semaphores to prevent memory leaks. The goroutine stops when
 // the provided context is cancelled.

@@ -305,7 +305,7 @@ func TestZeroTimeout(t *testing.T) {
 
 func TestStartPeriodicCleanup(t *testing.T) {
 	limiter := NewLimiter[string](10, 2, time.Second)
-	
+
 	// Create some client semaphores
 	clients := []string{"client1", "client2", "client3"}
 	for _, client := range clients {
@@ -315,35 +315,162 @@ func TestStartPeriodicCleanup(t *testing.T) {
 		}
 		closer.Close()
 	}
-	
+
 	// Verify semaphores exist
 	limiter.mu.RLock()
 	initialCount := len(limiter.clientSems)
 	limiter.mu.RUnlock()
-	
+
 	if initialCount != len(clients) {
 		t.Errorf("Expected %d client semaphores, got %d", len(clients), initialCount)
 	}
-	
+
 	// Start periodic cleanup with short interval
 	ctx, cancel := context.WithCancel(context.Background())
 	limiter.StartPeriodicCleanup(ctx, 50*time.Millisecond)
-	
+
 	// Wait for cleanup to run
 	time.Sleep(100 * time.Millisecond)
-	
+
 	// Check that semaphores were cleaned up
 	limiter.mu.RLock()
 	finalCount := len(limiter.clientSems)
 	limiter.mu.RUnlock()
-	
+
 	if finalCount != 0 {
 		t.Errorf("Expected 0 client semaphores after periodic cleanup, got %d", finalCount)
 	}
-	
+
 	// Cancel context and verify goroutine stops
 	cancel()
 	time.Sleep(10 * time.Millisecond) // Give goroutine time to stop
+}
+
+func TestClientLoad(t *testing.T) {
+	limiter := NewLimiter[string](10, 3, time.Second)
+
+	// Test load for non-existent client
+	used, total := limiter.ClientLoad("nonexistent")
+	if used != 0 || total != 3 {
+		t.Errorf("Expected (0, 3) for non-existent client, got (%d, %d)", used, total)
+	}
+
+	// Acquire one resource
+	closer1 := limiter.Acquire("client1")
+	if closer1 == nil {
+		t.Fatal("Failed to acquire first resource")
+	}
+
+	used, total = limiter.ClientLoad("client1")
+	if used != 1 || total != 3 {
+		t.Errorf("Expected (1, 3) after first acquire, got (%d, %d)", used, total)
+	}
+
+	// Acquire second resource
+	closer2 := limiter.Acquire("client1")
+	if closer2 == nil {
+		t.Fatal("Failed to acquire second resource")
+	}
+
+	used, total = limiter.ClientLoad("client1")
+	if used != 2 || total != 3 {
+		t.Errorf("Expected (2, 3) after second acquire, got (%d, %d)", used, total)
+	}
+
+	// Acquire third resource (should reach limit)
+	closer3 := limiter.Acquire("client1")
+	if closer3 == nil {
+		t.Fatal("Failed to acquire third resource")
+	}
+
+	used, total = limiter.ClientLoad("client1")
+	if used != 3 || total != 3 {
+		t.Errorf("Expected (3, 3) after third acquire, got (%d, %d)", used, total)
+	}
+
+	// Release one resource
+	closer1.Close()
+
+	used, total = limiter.ClientLoad("client1")
+	if used != 2 || total != 3 {
+		t.Errorf("Expected (2, 3) after first release, got (%d, %d)", used, total)
+	}
+
+	// Release all resources
+	closer2.Close()
+	closer3.Close()
+
+	used, total = limiter.ClientLoad("client1")
+	if used != 0 || total != 3 {
+		t.Errorf("Expected (0, 3) after all releases, got (%d, %d)", used, total)
+	}
+
+	// Test different client
+	closer4 := limiter.Acquire("client2")
+	if closer4 == nil {
+		t.Fatal("Failed to acquire for client2")
+	}
+
+	// Check both clients
+	used1, total1 := limiter.ClientLoad("client1")
+	used2, total2 := limiter.ClientLoad("client2")
+
+	if used1 != 0 || total1 != 3 {
+		t.Errorf("Expected (0, 3) for client1, got (%d, %d)", used1, total1)
+	}
+
+	if used2 != 1 || total2 != 3 {
+		t.Errorf("Expected (1, 3) for client2, got (%d, %d)", used2, total2)
+	}
+
+	closer4.Close()
+}
+
+func TestClientLoadConcurrent(t *testing.T) {
+	limiter := NewLimiter[int](10, 2, time.Second)
+
+	const numGoroutines = 5
+	var wg sync.WaitGroup
+
+	// Start goroutines that acquire and release resources
+	for i := range numGoroutines {
+		wg.Add(1)
+		go func(clientID int) {
+			defer wg.Done()
+
+			for range 10 {
+				closer := limiter.Acquire(clientID)
+				if closer != nil {
+					// Check load while holding resource
+					used, total := limiter.ClientLoad(clientID)
+					if used < 0 || used > total {
+						t.Errorf("Invalid load: used=%d, total=%d", used, total)
+					}
+
+					time.Sleep(1 * time.Millisecond)
+					closer.Close()
+				}
+			}
+		}(i % 3) // Use 3 different client IDs
+	}
+
+	// Concurrently check loads
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		for range 50 {
+			for clientID := range 3 {
+				used, total := limiter.ClientLoad(clientID)
+				if used < 0 || used > total || total != 2 {
+					t.Errorf("Invalid load for client %d: used=%d, total=%d", clientID, used, total)
+				}
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	wg.Wait()
 }
 
 func BenchmarkAcquireRelease(b *testing.B) {
