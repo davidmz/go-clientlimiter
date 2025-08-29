@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/davidmz/go-clientlimiter/timerpool"
 )
 
 // Closer represents an interface for releasing limiter resources.
@@ -61,6 +63,7 @@ type Limiter[K comparable] struct {
 	maxPerClient int                 // maximum concurrent operations per client
 	maxDelay     time.Duration       // maximum time to wait for resource acquisition
 	mu           sync.RWMutex        // protects clientSems map
+	timers       *timerpool.TimerPool
 }
 
 // NewLimiter creates a new two-level rate limiter. globalLimit: maximum
@@ -73,6 +76,7 @@ func NewLimiter[K comparable](globalLimit, perClientLimit int, maxDelay time.Dur
 		clientSems:   make(map[K]chan struct{}),
 		maxPerClient: perClientLimit,
 		maxDelay:     maxDelay,
+		timers:       timerpool.New(),
 	}
 }
 
@@ -102,8 +106,8 @@ func (l *Limiter[K]) Acquire(clientID K) (bool, Closer) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	timer := time.NewTimer(l.maxDelay)
-	defer timer.Stop()
+	timer := l.timers.Get(l.maxDelay)
+	defer timer.Put()
 
 	// Try to acquire global semaphore first
 	select {
@@ -116,12 +120,12 @@ func (l *Limiter[K]) Acquire(clientID K) (bool, Closer) {
 				globalSem: l.globalSem,
 				clientSem: clientSem,
 			}
-		case <-timer.C:
+		case <-timer.C():
 			// Client semaphore timeout, release global
 			<-l.globalSem
 			return false, &zeroCloser{}
 		}
-	case <-timer.C:
+	case <-timer.C():
 		// Global semaphore timeout
 		return false, &zeroCloser{}
 	}
