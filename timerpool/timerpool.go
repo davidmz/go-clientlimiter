@@ -60,7 +60,7 @@ type PooledTimer struct {
 // Get returns a pooled timer already Reset for the given interval. Before
 // resetting we ensure the timer is stopped and its channel is drained to
 // satisfy the Reset rules in the time package.
-func (tp *TimerPool) Get(interval time.Duration) *PooledTimer {
+func (tp *TimerPool) Get(interval time.Duration) PooledTimer {
 	t := tp.pool.Get().(*time.Timer)
 	// Ensure the timer is in a clean state before Reset:
 	// Stop returns whether the timer was active; if it wasn't, we must drain.
@@ -71,7 +71,8 @@ func (tp *TimerPool) Get(interval time.Duration) *PooledTimer {
 		}
 	}
 	t.Reset(interval)
-	return &PooledTimer{timer: t, pool: tp}
+	// Return value, not pointer, to prevent allocation
+	return PooledTimer{timer: t, pool: tp}
 }
 
 // C returns the underlying timer's channel.
