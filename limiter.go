@@ -5,7 +5,6 @@ package clientlimiter
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,46 +12,32 @@ import (
 	"github.com/davidmz/go-clientlimiter/timerpool"
 )
 
-// Closer represents an interface for releasing limiter resources.
-type Closer interface {
-	Close() error
+// Releaser releases acquired resources. Zero value is a no-op.
+// The Release method is idempotent for a given value. Avoid copying after use,
+// as copies maintain independent idempotency flags.
+type Releaser struct {
+	globalSem chan struct{}
+	clientSem chan struct{}
+	closed    atomic.Bool
 }
 
-// token represents an acquired resource that can be released. It holds direct
-// references to both global and client semaphores for efficient release.
-type token struct {
-	globalSem chan struct{} // reference to global semaphore
-	clientSem chan struct{} // reference to client-specific semaphore
-	closed    atomic.Bool   // atomic flag to prevent double-close
-}
-
-// Close releases the acquired resources back to both client and global
-// semaphores. Returns an error if semaphores are in an inconsistent state.
-// It is safe to call Close multiple times and on a nil token.
-func (t *token) Close() error {
-	if t == nil {
-		return nil
+// Release returns tokens to client and global semaphores. Safe to call multiple
+// times.
+func (r *Releaser) Release() {
+	if r == nil || r.clientSem == nil || r.globalSem == nil {
+		return
 	}
-
-	// Atomic check-and-set to prevent double-close
-	if t.closed.Swap(true) {
-		return nil // already closed
+	if r.closed.Swap(true) {
+		return
 	}
-
-	// Release client semaphore token
 	select {
-	case <-t.clientSem:
+	case <-r.clientSem:
 	default:
-		return errors.New("client semaphore is empty")
 	}
-
-	// Release global semaphore token
 	select {
-	case <-t.globalSem:
+	case <-r.globalSem:
 	default:
-		return errors.New("global semaphore is empty")
 	}
-	return nil
 }
 
 // Limiter provides two-level rate limiting: global and per-client. K is the
@@ -81,10 +66,10 @@ func NewLimiter[K comparable](globalLimit, perClientLimit int, maxDelay time.Dur
 }
 
 // Acquire tries to secure a resource for the given client, adhering to both
-// global and per-client constraints with a specified timeout.
-// Returns: ok and closer. If ok is false, closer will be nil.
-// Calling Close on a nil closer is safe and is a no-op.
-func (l *Limiter[K]) Acquire(clientID K) (bool, Closer) {
+// global and per-client constraints with a specified timeout. Returns: ok and
+// releaser value. If ok is false, releaser will be zero-value and calling
+// Release on it will be a no-op.
+func (l *Limiter[K]) Acquire(clientID K) (ok bool, rel Releaser) {
 	// Double-checked locking pattern to find or create client semaphore
 	l.mu.RLock()
 	clientSem, ok := l.clientSems[clientID]
@@ -105,52 +90,49 @@ func (l *Limiter[K]) Acquire(clientID K) (bool, Closer) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	// Fast happy path: check if both semaphores are available
+	// Fast happy path (non-blocking): try to acquire both semaphores
 	select {
 	case l.globalSem <- struct{}{}:
 		select {
 		case clientSem <- struct{}{}:
-			return true, &token{
-				globalSem: l.globalSem,
-				clientSem: clientSem,
-			}
+			return true, Releaser{globalSem: l.globalSem, clientSem: clientSem}
 		default:
-			// Client semaphore is full, release global and go to timer
+			// Client full: release global and fail
 			<-l.globalSem
+			return false, Releaser{}
 		}
 	default:
-		// Global semaphore is full, use timer
+		// Global full: proceed to slow path
 	}
 
+	// Slow path with timeout
 	timer := l.timers.Get(l.maxDelay)
 	defer timer.Put()
+	timeout := timer.C()
 
-	// Try to acquire global semaphore first
+	// Try global first with timeout
 	select {
 	case l.globalSem <- struct{}{}:
-		// Global acquired, now try client semaphore
-		select {
-		case clientSem <- struct{}{}:
-			// Both acquired successfully
-			return true, &token{
-				globalSem: l.globalSem,
-				clientSem: clientSem,
-			}
-		case <-timer.C():
-			// Client semaphore timeout, release global
-			<-l.globalSem
-			return false, nil
-		}
-	case <-timer.C():
-		// Global semaphore timeout
-		return false, nil
+		// proceed to client
+	case <-timeout:
+		return false, Releaser{}
+	}
+
+	// Try client with timeout
+	select {
+	case clientSem <- struct{}{}:
+		return true, Releaser{globalSem: l.globalSem, clientSem: clientSem}
+	case <-timeout:
+		// Client timeout: release global and fail
+		<-l.globalSem
+		return false, Releaser{}
 	}
 }
 
-// ClientLoad returns the current load for a specific client in a non-blocking way.
-// It returns the number of currently used tokens and the total capacity for the client.
-// If the client has never acquired resources, it returns (0, maxPerClient).
-// This method is useful for monitoring and load balancing decisions.
+// ClientLoad returns the current load for a specific client in a non-blocking
+// way. It returns the number of currently used tokens and the total capacity
+// for the client. If the client has never acquired resources, it returns (0,
+// maxPerClient).
 func (l *Limiter[K]) ClientLoad(clientID K) (used, total int) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()

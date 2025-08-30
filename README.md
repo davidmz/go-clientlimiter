@@ -29,8 +29,8 @@ func main() {
     limiter := clientlimiter.NewLimiter[string](10, 3, time.Second)
     
     // Acquire resource
-    if closer, ok := limiter.Acquire("client1"); ok {
-        defer closer.Close()
+    if ok, rel := limiter.Acquire("client1"); ok {
+        defer rel.Release() // release is idempotent
         // Do work...
         fmt.Println("Work completed")
     } else {
