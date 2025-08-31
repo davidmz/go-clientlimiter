@@ -71,10 +71,24 @@ func NewLimiter[K comparable](globalLimit, perClientLimit int, maxDelay time.Dur
 func (l *Limiter[K]) Acquire(clientID K) (ok bool, rel Releaser) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	
+
 	clientSem, found := l.clientSems.Load(clientID)
 	if !found {
 		clientSem, _ = l.clientSems.LoadOrStore(clientID, make(chan struct{}, l.maxPerClient))
+	}
+
+	// Fast path: try to acquire both semaphores without blocking
+	select {
+	case l.globalSem <- struct{}{}:
+		select {
+		case clientSem.(chan struct{}) <- struct{}{}:
+			return true, Releaser{globalSem: l.globalSem, clientSem: clientSem.(chan struct{})}
+		default:
+			// Client semaphore full, release global and fall through to slow path
+			<-l.globalSem
+		}
+	default:
+		// Global semaphore full, fall through to slow path
 	}
 
 	// Slow path with timeout
@@ -136,7 +150,7 @@ func (l *Limiter[K]) StartPeriodicCleanup(ctx context.Context, interval time.Dur
 func (l *Limiter[K]) cleanup() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	
+
 	// Remove client semaphores with no active tokens
 	l.clientSems.Range(func(key, value interface{}) bool {
 		sem := value.(chan struct{})
