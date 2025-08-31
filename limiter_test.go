@@ -7,6 +7,16 @@ import (
 	"time"
 )
 
+// mapSize returns the number of elements in a sync.Map
+func mapSize(m *sync.Map) int {
+	count := 0
+	m.Range(func(key, value interface{}) bool {
+		count++
+		return true
+	})
+	return count
+}
+
 func TestNewLimiter(t *testing.T) {
 	limiter := NewLimiter[string](10, 3, time.Second)
 
@@ -177,7 +187,7 @@ func TestCleanup(t *testing.T) {
 
 	// Check that client semaphores were created
 	limiter.mu.RLock()
-	initialCount := len(limiter.clientSems)
+	initialCount := mapSize(&limiter.clientSems)
 	limiter.mu.RUnlock()
 
 	if initialCount != len(clients) {
@@ -189,7 +199,7 @@ func TestCleanup(t *testing.T) {
 
 	// Check that empty semaphores were removed
 	limiter.mu.RLock()
-	finalCount := len(limiter.clientSems)
+	finalCount := mapSize(&limiter.clientSems)
 	limiter.mu.RUnlock()
 
 	if finalCount != 0 {
@@ -218,9 +228,9 @@ func TestCleanupWithActiveSemaphores(t *testing.T) {
 
 	// Only empty semaphore should be removed
 	limiter.mu.RLock()
-	count := len(limiter.clientSems)
-	_, hasClient1 := limiter.clientSems["client1"]
-	_, hasClient2 := limiter.clientSems["client2"]
+	count := mapSize(&limiter.clientSems)
+	_, hasClient1 := limiter.clientSems.Load("client1")
+	_, hasClient2 := limiter.clientSems.Load("client2")
 	limiter.mu.RUnlock()
 
 	if count != 1 {
@@ -280,7 +290,7 @@ func TestStartPeriodicCleanup(t *testing.T) {
 
 	// Verify semaphores exist
 	limiter.mu.RLock()
-	initialCount := len(limiter.clientSems)
+	initialCount := mapSize(&limiter.clientSems)
 	limiter.mu.RUnlock()
 
 	if initialCount != len(clients) {
@@ -296,7 +306,7 @@ func TestStartPeriodicCleanup(t *testing.T) {
 
 	// Check that semaphores were cleaned up
 	limiter.mu.RLock()
-	finalCount := len(limiter.clientSems)
+	finalCount := mapSize(&limiter.clientSems)
 	limiter.mu.RUnlock()
 
 	if finalCount != 0 {

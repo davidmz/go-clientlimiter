@@ -43,11 +43,11 @@ func (r *Releaser) Release() {
 // Limiter provides two-level rate limiting: global and per-client. K is the
 // type of client identifier (must be comparable for use as map key).
 type Limiter[K comparable] struct {
-	globalSem    chan struct{}       // global semaphore limiting total concurrent operations
-	clientSems   map[K]chan struct{} // per-client semaphores
-	maxPerClient int                 // maximum concurrent operations per client
-	maxDelay     time.Duration       // maximum time to wait for resource acquisition
-	mu           sync.RWMutex        // protects clientSems map
+	globalSem    chan struct{} // global semaphore limiting total concurrent operations
+	clientSems   sync.Map      // per-client semaphores
+	maxPerClient int           // maximum concurrent operations per client
+	maxDelay     time.Duration // maximum time to wait for resource acquisition
+	mu           sync.RWMutex  // protects against cleanup during acquire and load operations
 	timers       *timerpool.TimerPool
 }
 
@@ -58,7 +58,6 @@ type Limiter[K comparable] struct {
 func NewLimiter[K comparable](globalLimit, perClientLimit int, maxDelay time.Duration) *Limiter[K] {
 	return &Limiter[K]{
 		globalSem:    make(chan struct{}, globalLimit),
-		clientSems:   make(map[K]chan struct{}),
 		maxPerClient: perClientLimit,
 		maxDelay:     maxDelay,
 		timers:       timerpool.New(),
@@ -70,39 +69,12 @@ func NewLimiter[K comparable](globalLimit, perClientLimit int, maxDelay time.Dur
 // releaser value. If ok is false, releaser will be zero-value and calling
 // Release on it will be a no-op.
 func (l *Limiter[K]) Acquire(clientID K) (ok bool, rel Releaser) {
-	// Double-checked locking pattern to find or create client semaphore
-	l.mu.RLock()
-	clientSem, ok := l.clientSems[clientID]
-	l.mu.RUnlock()
-	if !ok {
-		// Client semaphore doesn't exist, create it under write lock
-		l.mu.Lock()
-		clientSem, ok = l.clientSems[clientID] // check again under write lock
-		if !ok {
-			clientSem = make(chan struct{}, l.maxPerClient)
-			l.clientSems[clientID] = clientSem
-		}
-		l.mu.Unlock()
-	}
-
-	// Acquire resources under read lock (semaphores are safe for concurrent
-	// use)
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-
-	// Fast happy path (non-blocking): try to acquire both semaphores
-	select {
-	case l.globalSem <- struct{}{}:
-		select {
-		case clientSem <- struct{}{}:
-			return true, Releaser{globalSem: l.globalSem, clientSem: clientSem}
-		default:
-			// Client full: release global and fail
-			<-l.globalSem
-			return false, Releaser{}
-		}
-	default:
-		// Global full: proceed to slow path
+	
+	clientSem, found := l.clientSems.Load(clientID)
+	if !found {
+		clientSem, _ = l.clientSems.LoadOrStore(clientID, make(chan struct{}, l.maxPerClient))
 	}
 
 	// Slow path with timeout
@@ -115,17 +87,17 @@ func (l *Limiter[K]) Acquire(clientID K) (ok bool, rel Releaser) {
 	case l.globalSem <- struct{}{}:
 		// proceed to client
 	case <-timeout:
-		return false, Releaser{}
+		return
 	}
 
 	// Try client with timeout
 	select {
-	case clientSem <- struct{}{}:
-		return true, Releaser{globalSem: l.globalSem, clientSem: clientSem}
+	case clientSem.(chan struct{}) <- struct{}{}:
+		return true, Releaser{globalSem: l.globalSem, clientSem: clientSem.(chan struct{})}
 	case <-timeout:
 		// Client timeout: release global and fail
 		<-l.globalSem
-		return false, Releaser{}
+		return
 	}
 }
 
@@ -134,10 +106,11 @@ func (l *Limiter[K]) Acquire(clientID K) (ok bool, rel Releaser) {
 // for the client. If the client has never acquired resources, it returns (0,
 // maxPerClient).
 func (l *Limiter[K]) ClientLoad(clientID K) (used, total int) {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	clientSem := l.clientSems[clientID]
-	return len(clientSem), l.maxPerClient
+	clientSem, found := l.clientSems.Load(clientID)
+	if !found {
+		return 0, l.maxPerClient
+	}
+	return len(clientSem.(chan struct{})), l.maxPerClient
 }
 
 // StartPeriodicCleanup starts a background goroutine that periodically removes
@@ -163,11 +136,13 @@ func (l *Limiter[K]) StartPeriodicCleanup(ctx context.Context, interval time.Dur
 func (l *Limiter[K]) cleanup() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
+	
 	// Remove client semaphores with no active tokens
-	for id, sem := range l.clientSems {
+	l.clientSems.Range(func(key, value interface{}) bool {
+		sem := value.(chan struct{})
 		if len(sem) == 0 {
-			delete(l.clientSems, id)
+			l.clientSems.Delete(key)
 		}
-	}
+		return true
+	})
 }
