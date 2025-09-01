@@ -43,10 +43,13 @@ func (r *Releaser) Release() {
 // Limiter provides two-level rate limiting: global and per-client. K is the
 // type of client identifier (must be comparable for use as map key).
 type Limiter[K comparable] struct {
+	ClientLimitByKey func(clientID K) int           // optional function to get per-client limit
+	DelayByKey       func(clientID K) time.Duration // optional function to get per-client delay
+
 	globalSem    chan struct{} // global semaphore limiting total concurrent operations
 	clientSems   sync.Map      // per-client semaphores
-	maxPerClient int           // maximum concurrent operations per client
-	maxDelay     time.Duration // maximum time to wait for resource acquisition
+	maxPerClient int           // default maximum concurrent operations per client
+	maxDelay     time.Duration // default maximum time to wait for resource acquisition
 	mu           sync.RWMutex  // protects against cleanup during acquire and load operations
 	timers       *timerpool.TimerPool
 }
@@ -72,9 +75,20 @@ func (l *Limiter[K]) Acquire(clientID K) (ok bool, rel Releaser) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
+	// Get client-specific limit and delay
+	clientLimit := l.maxPerClient
+	if l.ClientLimitByKey != nil {
+		clientLimit = l.ClientLimitByKey(clientID)
+	}
+
+	clientDelay := l.maxDelay
+	if l.DelayByKey != nil {
+		clientDelay = l.DelayByKey(clientID)
+	}
+
 	clientSem, found := l.clientSems.Load(clientID)
 	if !found {
-		clientSem, _ = l.clientSems.LoadOrStore(clientID, make(chan struct{}, l.maxPerClient))
+		clientSem, _ = l.clientSems.LoadOrStore(clientID, make(chan struct{}, clientLimit))
 	}
 
 	// Fast path: try to acquire both semaphores without blocking
@@ -92,7 +106,7 @@ func (l *Limiter[K]) Acquire(clientID K) (ok bool, rel Releaser) {
 	}
 
 	// Slow path with timeout
-	timer := l.timers.Get(l.maxDelay)
+	timer := l.timers.Get(clientDelay)
 	defer timer.Put()
 	timeout := timer.C()
 
@@ -120,11 +134,17 @@ func (l *Limiter[K]) Acquire(clientID K) (ok bool, rel Releaser) {
 // for the client. If the client has never acquired resources, it returns (0,
 // maxPerClient).
 func (l *Limiter[K]) ClientLoad(clientID K) (used, total int) {
+	// Get client-specific limit
+	clientLimit := l.maxPerClient
+	if l.ClientLimitByKey != nil {
+		clientLimit = l.ClientLimitByKey(clientID)
+	}
+
 	clientSem, found := l.clientSems.Load(clientID)
 	if !found {
-		return 0, l.maxPerClient
+		return 0, clientLimit
 	}
-	return len(clientSem.(chan struct{})), l.maxPerClient
+	return len(clientSem.(chan struct{})), clientLimit
 }
 
 // StartPeriodicCleanup starts a background goroutine that periodically removes

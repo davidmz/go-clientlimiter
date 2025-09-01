@@ -10,7 +10,7 @@ import (
 // mapSize returns the number of elements in a sync.Map
 func mapSize(m *sync.Map) int {
 	count := 0
-	m.Range(func(key, value interface{}) bool {
+	m.Range(func(key, value any) bool {
 		count++
 		return true
 	})
@@ -473,4 +473,196 @@ func BenchmarkHighContention(b *testing.B) {
 			clientID = (clientID + 1) % 100 // Many clients competing
 		}
 	})
+}
+
+func TestClientLimitByKey(t *testing.T) {
+	limiter := NewLimiter[string](10, 2, time.Second)
+
+	// Set custom limits for different clients
+	limiter.ClientLimitByKey = func(clientID string) int {
+		switch clientID {
+		case "premium":
+			return 5
+		case "basic":
+			return 1
+		default:
+			return 2 // default
+		}
+	}
+
+	// Test premium client can acquire up to 5 resources
+	var premiumRels []*Releaser
+	for i := range 5 {
+		ok, rel := limiter.Acquire("premium")
+		if !ok {
+			t.Fatalf("Premium client should be able to acquire %d resources, failed at %d", 5, i+1)
+		}
+		premiumRels = append(premiumRels, &rel)
+	}
+
+	// 6th acquisition should fail for premium
+	ok, _ := limiter.Acquire("premium")
+	if ok {
+		t.Error("Premium client should not be able to acquire more than 5 resources")
+	}
+
+	// Test basic client can acquire only 1 resource
+	ok1, rel1 := limiter.Acquire("basic")
+	if !ok1 {
+		t.Fatal("Basic client should be able to acquire 1 resource")
+	}
+
+	ok2, _ := limiter.Acquire("basic")
+	if ok2 {
+		t.Error("Basic client should not be able to acquire more than 1 resource")
+	}
+
+	// Test default client gets default limit (2)
+	ok3, rel3 := limiter.Acquire("default")
+	ok4, rel4 := limiter.Acquire("default")
+	if !ok3 || !ok4 {
+		t.Fatal("Default client should be able to acquire 2 resources")
+	}
+
+	ok5, _ := limiter.Acquire("default")
+	if ok5 {
+		t.Error("Default client should not be able to acquire more than 2 resources")
+	}
+
+	// Test ClientLoad returns correct limits
+	used, total := limiter.ClientLoad("premium")
+	if used != 5 || total != 5 {
+		t.Errorf("Expected premium client load (5, 5), got (%d, %d)", used, total)
+	}
+
+	used, total = limiter.ClientLoad("basic")
+	if used != 1 || total != 1 {
+		t.Errorf("Expected basic client load (1, 1), got (%d, %d)", used, total)
+	}
+
+	used, total = limiter.ClientLoad("default")
+	if used != 2 || total != 2 {
+		t.Errorf("Expected default client load (2, 2), got (%d, %d)", used, total)
+	}
+
+	// Test non-existent client gets custom limit
+	used, total = limiter.ClientLoad("nonexistent")
+	if used != 0 || total != 2 {
+		t.Errorf("Expected nonexistent client load (0, 2), got (%d, %d)", used, total)
+	}
+
+	// Clean up
+	for _, rel := range premiumRels {
+		rel.Release()
+	}
+	rel1.Release()
+	rel3.Release()
+	rel4.Release()
+}
+
+func TestDelayByKey(t *testing.T) {
+	limiter := NewLimiter[string](1, 1, 100*time.Millisecond) // Global limit of 1
+
+	// Set custom delays for different clients
+	limiter.DelayByKey = func(clientID string) time.Duration {
+		switch clientID {
+		case "fast":
+			return 10 * time.Millisecond
+		case "slow":
+			return 200 * time.Millisecond
+		default:
+			return 100 * time.Millisecond // default
+		}
+	}
+
+	// Acquire the only global resource
+	ok1, rel1 := limiter.Acquire("holder")
+	if !ok1 {
+		t.Fatal("Should be able to acquire first resource")
+	}
+
+	// Test fast client times out quickly
+	start := time.Now()
+	ok2, _ := limiter.Acquire("fast")
+	elapsed := time.Since(start)
+
+	if ok2 {
+		t.Error("Fast client should timeout")
+	}
+
+	if elapsed < 5*time.Millisecond || elapsed > 50*time.Millisecond {
+		t.Errorf("Fast client should timeout around 10ms, took %v", elapsed)
+	}
+
+	// Test slow client times out slowly
+	start = time.Now()
+	ok3, _ := limiter.Acquire("slow")
+	elapsed = time.Since(start)
+
+	if ok3 {
+		t.Error("Slow client should timeout")
+	}
+
+	if elapsed < 150*time.Millisecond || elapsed > 250*time.Millisecond {
+		t.Errorf("Slow client should timeout around 200ms, took %v", elapsed)
+	}
+
+	// Test default client uses default delay
+	start = time.Now()
+	ok4, _ := limiter.Acquire("default")
+	elapsed = time.Since(start)
+
+	if ok4 {
+		t.Error("Default client should timeout")
+	}
+
+	if elapsed < 80*time.Millisecond || elapsed > 150*time.Millisecond {
+		t.Errorf("Default client should timeout around 100ms, took %v", elapsed)
+	}
+
+	rel1.Release()
+}
+
+func TestClientLimitByKeyWithCleanup(t *testing.T) {
+	limiter := NewLimiter[string](10, 2, time.Second)
+
+	// Set custom limits
+	limiter.ClientLimitByKey = func(clientID string) int {
+		if clientID == "large" {
+			return 5
+		}
+		return 1
+	}
+
+	// Create semaphores with different sizes
+	ok1, rel1 := limiter.Acquire("large")
+	ok2, rel2 := limiter.Acquire("small")
+
+	if !ok1 || !ok2 {
+		t.Fatal("Should be able to acquire resources")
+	}
+
+	// Release resources
+	rel1.Release()
+	rel2.Release()
+
+	// Check that semaphores were created
+	limiter.mu.RLock()
+	initialCount := mapSize(&limiter.clientSems)
+	limiter.mu.RUnlock()
+
+	if initialCount != 2 {
+		t.Errorf("Expected 2 client semaphores, got %d", initialCount)
+	}
+
+	// Run cleanup - both should be removed as they're empty
+	limiter.cleanup()
+
+	limiter.mu.RLock()
+	finalCount := mapSize(&limiter.clientSems)
+	limiter.mu.RUnlock()
+
+	if finalCount != 0 {
+		t.Errorf("Expected 0 client semaphores after cleanup, got %d", finalCount)
+	}
 }
