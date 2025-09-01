@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/davidmz/go-clientlimiter/onetime"
-	"github.com/davidmz/go-clientlimiter/timerpool"
+	"github.com/davidmz/go-clientlimiter/v2/onetime"
+	"github.com/davidmz/go-clientlimiter/v2/timerpool"
 )
 
 // Releaser releases acquired resources. Zero value is a no-op.
