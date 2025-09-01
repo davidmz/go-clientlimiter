@@ -30,7 +30,7 @@ func main() {
     
     // Acquire resource
     if ok, rel := limiter.Acquire("client1"); ok {
-        defer rel.Release() // release is idempotent
+        defer rel.Release() // release is idempotent, returns bool
         // Do work...
         fmt.Println("Work completed")
     } else {
