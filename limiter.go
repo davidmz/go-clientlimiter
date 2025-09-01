@@ -6,29 +6,29 @@ package clientlimiter
 import (
 	"context"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"github.com/davidmz/go-clientlimiter/onetime"
 	"github.com/davidmz/go-clientlimiter/timerpool"
 )
 
 // Releaser releases acquired resources. Zero value is a no-op.
-// The Release method is idempotent for a given value. Avoid copying after use,
-// as copies maintain independent idempotency flags.
+// The Release method is idempotent and safe to call multiple times.
+// Copying is now safe as release state is tracked via onetime tokens.
 type Releaser struct {
 	globalSem chan struct{}
 	clientSem chan struct{}
-	closed    atomic.Bool
+	token     onetime.Token
 }
 
 // Release returns tokens to client and global semaphores. Safe to call multiple
-// times.
-func (r *Releaser) Release() {
-	if r == nil || r.clientSem == nil || r.globalSem == nil {
-		return
-	}
-	if r.closed.Swap(true) {
-		return
+// times. Returns true if resources were actually released, false if already released.
+func (r *Releaser) Release() bool {
+	if r == nil ||
+		r.clientSem == nil ||
+		r.globalSem == nil ||
+		!r.token.Release() { // already released
+		return false
 	}
 	select {
 	case <-r.clientSem:
@@ -38,6 +38,7 @@ func (r *Releaser) Release() {
 	case <-r.globalSem:
 	default:
 	}
+	return true
 }
 
 // Limiter provides two-level rate limiting: global and per-client. K is the
@@ -52,6 +53,7 @@ type Limiter[K comparable] struct {
 	maxDelay     time.Duration // default maximum time to wait for resource acquisition
 	mu           sync.RWMutex  // protects against cleanup during acquire and load operations
 	timers       *timerpool.TimerPool
+	tokensPool   *onetime.Registry
 }
 
 // NewLimiter creates a new two-level rate limiter. globalLimit: maximum
@@ -64,6 +66,7 @@ func NewLimiter[K comparable](globalLimit, perClientLimit int, maxDelay time.Dur
 		maxPerClient: perClientLimit,
 		maxDelay:     maxDelay,
 		timers:       timerpool.New(),
+		tokensPool:   onetime.NewRegistry(),
 	}
 }
 
@@ -96,7 +99,11 @@ func (l *Limiter[K]) Acquire(clientID K) (ok bool, rel Releaser) {
 	case l.globalSem <- struct{}{}:
 		select {
 		case clientSem.(chan struct{}) <- struct{}{}:
-			return true, Releaser{globalSem: l.globalSem, clientSem: clientSem.(chan struct{})}
+			return true, Releaser{
+				globalSem: l.globalSem,
+				clientSem: clientSem.(chan struct{}),
+				token:     l.tokensPool.Acquire(),
+			}
 		default:
 			// Client semaphore full, release global and fall through to slow path
 			<-l.globalSem
@@ -121,7 +128,11 @@ func (l *Limiter[K]) Acquire(clientID K) (ok bool, rel Releaser) {
 	// Try client with timeout
 	select {
 	case clientSem.(chan struct{}) <- struct{}{}:
-		return true, Releaser{globalSem: l.globalSem, clientSem: clientSem.(chan struct{})}
+		return true, Releaser{
+			globalSem: l.globalSem,
+			clientSem: clientSem.(chan struct{}),
+			token:     l.tokensPool.Acquire(),
+		}
 	case <-timeout:
 		// Client timeout: release global and fail
 		<-l.globalSem
